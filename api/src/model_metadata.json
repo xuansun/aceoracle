@@ -1,0 +1,22 @@
+{
+  "accuracy": 0.7702,
+  "brier_score": 0.1571,
+  "log_loss": 0.4808,
+  "train_years": "2005-2023",
+  "val_years": "[2024, 2025]",
+  "n_train": 55426,
+  "n_val": 3076,
+  "feature_cols": [
+    "elo_delta",
+    "elo_surf_delta",
+    "h2h_advantage",
+    "h2h_surface_advantage",
+    "form_delta",
+    "rest_delta",
+    "matches_30d_delta",
+    "rank_delta",
+    "is_clay",
+    "is_grass",
+    "is_bo5"
+  ]
+}

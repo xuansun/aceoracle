@@ -1,0 +1,12 @@
+name = "aceoracle"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+WALLET_ADDRESS = "0xf296E3789F98C87003328F7047D010eFDc02eCdd"
+FACILITATOR_URL = "https://facilitator.xpay.sh"
+
+# KV namespace for caching predictions (create via wrangler)
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = "your-kv-namespace-id"

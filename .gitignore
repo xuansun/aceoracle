@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.wrangler/
+.env
+data/tennis_atp/
+data/processed/
+models/*.json
+api/src/players.json
+api/src/h2h.json
