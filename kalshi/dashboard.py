@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from rich.text import Text
@@ -77,6 +79,8 @@ class MarketRow:
     edge_data: dict
     prediction: dict
     raw_market: dict
+    consensus_prob: float | None = None
+    live_score: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +194,7 @@ class BettingDashboard(App):
         Binding("b", "bet", "Bet"),
         Binding("q", "quit", "Quit"),
     ]
+    REFRESH_INTERVAL = 120  # seconds
 
     markets_data: reactive[list[MarketRow]] = reactive([], layout=True)
     selected_idx: reactive[int] = reactive(0)
@@ -205,18 +210,46 @@ class BettingDashboard(App):
         self._client: Any = None
         self._predictor: TennisPredictor | None = None
         self._demo_mode = not bool(key_id and private_key_path)
+        self._init_error: str = ""
 
         if not self._demo_mode:
             try:
                 from client import KalshiClient
                 self._client = KalshiClient(key_id, private_key_path)  # type: ignore[arg-type]
-            except Exception:
+            except Exception as e:
                 self._demo_mode = True
+                self._init_error = str(e)
 
         try:
             self._predictor = TennisPredictor()
         except Exception:
             self._predictor = None
+
+        # Auto-bet config (all off by default)
+        self._autobet_enabled = os.getenv("AUTO_BET", "false").lower() == "true"
+        self._autobet_threshold = float(os.getenv("AUTO_BET_EDGE_THRESHOLD", "0.08"))
+        self._autobet_max_contracts = int(os.getenv("AUTO_BET_MAX_CONTRACTS", "10"))
+        self._bet_tickers: set[str] = set()  # track markets already bet this session
+
+        # Optional external data clients
+        self._odds_client = None
+        self._tennis_client = None
+        self._odds_cache: list[dict] = []
+        self._odds_cache_ts: float = 0.0
+        odds_key = os.getenv("ODDS_API_KEY")
+        tennis_key = os.getenv("TENNIS_RAPIDAPI_KEY")
+        if odds_key:
+            try:
+                from odds_client import OddsApiClient
+                self._odds_client = OddsApiClient(odds_key)
+            except Exception:
+                pass
+        if tennis_key:
+            try:
+                from tennis_client import TennisApiClient
+                self._tennis_client = TennisApiClient(tennis_key)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -229,7 +262,8 @@ class BettingDashboard(App):
             with Container(id="table-container"):
                 table = DataTable(id="markets-table", cursor_type="row")
                 table.add_columns(
-                    "Match", "Surf", "Our%", "Mkt%", "Edge", "Side", "Kelly%"
+                    "Match", "Surf", "Our%", "Mkt%", "Edge", "Side", "Kelly%",
+                    "Consensus", "Score",
                 )
                 yield table
             yield Static(id="detail-panel", markup=True)
@@ -237,6 +271,7 @@ class BettingDashboard(App):
 
     def on_mount(self) -> None:
         self.run_worker(self.refresh_data(), exclusive=True)
+        self.set_interval(self.REFRESH_INTERVAL, self.action_refresh)
 
     # ------------------------------------------------------------------
     # Data loading
@@ -248,9 +283,15 @@ class BettingDashboard(App):
 
         if self._demo_mode:
             rows = self._build_demo_rows()
-            self._set_status("[yellow]DEMO MODE — set KALSHI_API_KEY to connect[/yellow]")
+            err_suffix = f" — {self._init_error}" if self._init_error else ""
+            self._set_status(
+                f"[yellow]DEMO MODE — set KALSHI_API_KEY to connect{err_suffix}[/yellow]"
+            )
         else:
             rows = await asyncio.get_event_loop().run_in_executor(None, self._fetch_live_rows)
+
+        # Enrich rows with external data sources (odds + live scores)
+        rows = await asyncio.get_event_loop().run_in_executor(None, self._enrich_rows, rows)
 
         self.markets_data = rows
         self.update_table()
@@ -306,6 +347,94 @@ class BettingDashboard(App):
 
         self._set_status(f"[green]Loaded {len(rows)} markets[/green]")
         return rows
+
+    def _enrich_rows(self, rows: list[MarketRow]) -> list[MarketRow]:
+        """Annotate rows with bookmaker consensus prob and live scores, then auto-bet."""
+        # Fetch bookmaker odds (cache for 15 min to save API quota)
+        odds_data: list[dict] = []
+        if self._odds_client is not None:
+            now = time.monotonic()
+            if now - self._odds_cache_ts > 900 or not self._odds_cache:
+                try:
+                    self._odds_cache = self._odds_client.get_tennis_odds()
+                    self._odds_cache_ts = now
+                except Exception:
+                    pass
+            odds_data = self._odds_cache
+
+        # Fetch today's tennis matches (live score data)
+        tennis_matches: list[dict] = []
+        if self._tennis_client is not None:
+            try:
+                tennis_matches = self._tennis_client.get_today_matches()
+            except Exception:
+                pass
+
+        for row in rows:
+            p1 = row.p1_name or ""
+            p2 = row.p2_name or ""
+
+            # Consensus prob from bookmakers
+            if self._odds_client is not None and odds_data and p1 and p2:
+                odds_match = self._odds_client.find_match(p1, p2, odds_data)
+                if odds_match is not None:
+                    row.consensus_prob = self._odds_client.get_consensus_prob(odds_match, p1)
+
+            # Live score from API-Tennis
+            if self._tennis_client is not None and tennis_matches and p1 and p2:
+                tennis_match = self._tennis_client.find_match(p1, p2, tennis_matches)
+                if tennis_match is not None:
+                    row.live_score = self._tennis_client.get_score_str(tennis_match)
+
+            # Auto-bet if conditions met
+            self._maybe_autobet(row)
+
+        return rows
+
+    def _maybe_autobet(self, row: MarketRow) -> None:
+        if not self._autobet_enabled or self._demo_mode:
+            return
+        if row.ticker in self._bet_tickers:
+            return
+        if not row.edge_data or not row.edge_data.get("has_edge"):
+            return
+        if row.edge_data.get("best_edge", row.edge_data.get("yes_edge", 0)) < self._autobet_threshold:
+            return
+
+        side = row.edge_data.get("best_side")
+        if not side:
+            return
+        yes_price = row.raw_market.get("yes_ask", row.raw_market.get("last_price", 50))
+        price = yes_price if side == "yes" else (100 - yes_price)
+        kelly = row.edge_data.get("kelly_fraction", 0)
+        balance = self.balance_cents
+
+        spend_cents = int(kelly * balance)
+        contracts = min(self._autobet_max_contracts, max(1, spend_cents // max(price, 1)))
+
+        try:
+            self._client.place_order(row.ticker, side, contracts)
+            self._bet_tickers.add(row.ticker)
+            self._log_bet(row, side, contracts)
+            best_edge = row.edge_data.get("best_edge", row.edge_data.get("yes_edge", 0))
+            self._set_status(
+                f"Auto-bet {contracts}x {side.upper()} on {row.p1_name} "
+                f"({best_edge:.1%} edge)"
+            )
+        except Exception as e:
+            self._set_status(f"Auto-bet failed: {e}")
+
+    def _log_bet(self, row: MarketRow, side: str, contracts: int) -> None:
+        from datetime import datetime
+        log_path = Path(__file__).parent / "bets.log"
+        best_edge = row.edge_data.get("best_edge", row.edge_data.get("yes_edge", 0))
+        line = (
+            f"{datetime.now().isoformat()} | {row.ticker} | {side.upper()} | "
+            f"{contracts} contracts | edge={best_edge:.1%} | "
+            f"p1={row.p1_name} vs p2={row.p2_name} | our_prob={row.p1_prob:.3f}\n"
+        )
+        with open(log_path, "a") as f:
+            f.write(line)
 
     def _build_demo_rows(self) -> list[MarketRow]:
         rows: list[MarketRow] = []
@@ -379,6 +508,11 @@ class BettingDashboard(App):
             if len(match_label) > 38:
                 match_label = match_label[:35] + "…"
 
+            consensus_str = (
+                f"{row.consensus_prob*100:.1f}%" if row.consensus_prob is not None else "—"
+            )
+            score_str = row.live_score if row.live_score else "—"
+
             table.add_row(
                 match_label,
                 row.surface[:4].title(),
@@ -387,6 +521,8 @@ class BettingDashboard(App):
                 edge_cell,
                 side_cell,
                 f"{ed.get('kelly_fraction', 0)*100:.1f}%",
+                consensus_str,
+                score_str,
             )
 
     def _update_detail(self, idx: int) -> None:
@@ -497,8 +633,14 @@ class BettingDashboard(App):
 if __name__ == "__main__":
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(Path(__file__).parent / ".env")  # always load from script dir
     key_id = os.getenv("KALSHI_KEY_ID")
-    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private.pem")
+    key_path_raw = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private.pem")
+    # Resolve relative paths to script dir so dashboard works from any CWD
+    key_path = (
+        str(Path(__file__).parent / key_path_raw)
+        if not os.path.isabs(key_path_raw)
+        else key_path_raw
+    )
     app = BettingDashboard(key_id=key_id, private_key_path=key_path)
     app.run()
