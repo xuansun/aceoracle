@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 
 class KalshiClient:
-    BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
     def __init__(self, key_id: str, private_key_path: str) -> None:
         self.key_id = key_id

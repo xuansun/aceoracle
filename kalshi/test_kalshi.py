@@ -17,7 +17,7 @@ if key_path and not os.path.isabs(key_path):
 with open(key_path, "rb") as f:
     private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
 
-BASE = "https://trading-api.kalshi.com/trade-api/v2"
+BASE = "https://api.elections.kalshi.com/trade-api/v2"
 endpoint = "/portfolio/balance"
 
 def try_auth(label, ts, path):
