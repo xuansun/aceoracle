@@ -7,3 +7,7 @@ data/processed/
 models/*.json
 api/src/players.json
 api/src/h2h.json
+kalshi_private.pem
+.env
+__pycache__/
+*.pyc

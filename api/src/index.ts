@@ -25,6 +25,7 @@ const PRICES: Record<string, { amount: string; desc: string }> = {
   "/player": { amount: "0.01", desc: "Player profile with Elo ratings" },
   "/matchup": { amount: "0.05", desc: "Head-to-head analysis" },
   "/predict": { amount: "0.10", desc: "Match outcome prediction" },
+  "/edge-finder": { amount: "0.25", desc: "Kalshi market edge finder with Kelly sizing" },
 };
 
 // === Load Data ===
@@ -239,9 +240,124 @@ app.get("/", (c) => {
       "/player/:id": { price: "$0.01", description: "Player profile + Elo ratings" },
       "/matchup?p1=X&p2=Y&surface=Z": { price: "$0.05", description: "Head-to-head analysis" },
       "/predict?p1=X&p2=Y&surface=Z": { price: "$0.10", description: "Match prediction" },
+      "/edge-finder?p1=X&p2=Y&surface=Z&yes_price=N&best_of=3": { price: "$0.25", description: "Kalshi market edge finder with Kelly sizing" },
     },
   });
 });
+
+// === Discovery Endpoints ===
+
+app.get("/.well-known/x402", (c) => {
+  return c.json({
+    x402Version: 2,
+    name: "AceOracle",
+    description: "Tennis intelligence API — Elo ratings, match predictions, and H2H analysis for 2,640+ ATP players.",
+    url: "https://aceoracle.aceoracle-tennis.workers.dev",
+    facilitator: FACILITATOR,
+    network: NETWORK,
+    wallet: WALLET,
+    endpoints: [
+      {
+        path: "/player/:id",
+        method: "GET",
+        price: "0.01",
+        asset: "USDC",
+        description: "Player profile with overall and surface-specific Elo ratings",
+        inputSchema: {
+          params: { id: { type: "string", description: "ATP player ID (e.g. 206173) or name (e.g. sinner)" } },
+        },
+      },
+      {
+        path: "/matchup",
+        method: "GET",
+        price: "0.05",
+        asset: "USDC",
+        description: "Head-to-head analysis between two players on a specific surface",
+        inputSchema: {
+          queryParams: {
+            p1: { type: "string", description: "Player 1 ID or name", required: true },
+            p2: { type: "string", description: "Player 2 ID or name", required: true },
+            surface: { type: "string", description: "hard, clay, or grass", required: false },
+          },
+        },
+      },
+      {
+        path: "/predict",
+        method: "GET",
+        price: "0.10",
+        asset: "USDC",
+        description: "Match outcome prediction with win probabilities and key factors",
+        inputSchema: {
+          queryParams: {
+            p1: { type: "string", description: "Player 1 ID or name", required: true },
+            p2: { type: "string", description: "Player 2 ID or name", required: true },
+            surface: { type: "string", description: "hard, clay, or grass", required: false },
+            best_of: { type: "string", description: "3 or 5", required: false },
+          },
+        },
+      },
+      {
+        path: "/edge-finder",
+        method: "GET",
+        price: "0.25",
+        asset: "USDC",
+        description: "Compare our model probability vs Kalshi market price to find edges, with half-Kelly sizing",
+        inputSchema: {
+          queryParams: {
+            p1: { type: "string", description: "Player 1 ID or name", required: true },
+            p2: { type: "string", description: "Player 2 ID or name", required: true },
+            surface: { type: "string", description: "hard, clay, or grass", required: false },
+            yes_price: { type: "string", description: "Kalshi yes price in cents (1-99) for p1 winning", required: true },
+            best_of: { type: "string", description: "3 or 5", required: false },
+          },
+        },
+      },
+    ],
+  });
+});
+
+app.get("/llms.txt", (c) => {
+  return c.text(`# AceOracle — Tennis Intelligence API
+
+> Pay-per-call tennis analytics via x402. USDC on Base.
+
+## Endpoints
+
+### GET /player/:id ($0.01)
+Returns player profile with Elo ratings (overall, hard, clay, grass), total matches, and best surface.
+Parameter: id = ATP player ID (e.g. 206173) or name (e.g. sinner, alcaraz, djokovic)
+
+### GET /matchup?p1=X&p2=Y&surface=Z ($0.05)
+Returns head-to-head record, Elo delta, and surface-specific comparison.
+Parameters: p1 = player 1, p2 = player 2, surface = hard|clay|grass (default: hard)
+
+### GET /predict?p1=X&p2=Y&surface=Z&best_of=3 ($0.10)
+Returns win probabilities, predicted sets, confidence score, and key factors.
+Parameters: p1 = player 1, p2 = player 2, surface = hard|clay|grass, best_of = 3|5
+
+### GET /edge-finder?p1=X&p2=Y&surface=Z&yes_price=N&best_of=3 ($0.25)
+Compares model probability against Kalshi market price to find betting edges with half-Kelly sizing.
+Parameters: p1 = player 1, p2 = player 2, surface = hard|clay|grass, yes_price = Kalshi yes price in cents (1-99) for p1 winning, best_of = 3|5
+
+## Payment
+Protocol: x402
+Network: Base (eip155:8453)
+Asset: USDC
+Facilitator: https://facilitator.xpay.sh
+
+## Data
+Source: Jeff Sackmann / Tennis Abstract (ATP matches 2000-2024)
+Players: 2,640+
+Model: XGBoost with surface-specific Elo, H2H, form, fatigue features
+Accuracy: 77% on validation set
+
+## Links
+API: https://aceoracle.aceoracle-tennis.workers.dev
+GitHub: https://github.com/rollingthedice/aceoracle
+`);
+});
+
+
 
 // === Paid Endpoints ===
 
@@ -312,6 +428,100 @@ app.get("/predict", (c) => {
     },
     prediction: pred,
     meta: { model_version: "elo-xgb-v1", data_as_of: "2024", cost: "$0.10 USDC" },
+  });
+});
+
+app.get("/edge-finder", (c) => {
+  const q1 = c.req.query("p1");
+  const q2 = c.req.query("p2");
+  const surface = c.req.query("surface") || "hard";
+  const bestOf = parseInt(c.req.query("best_of") || "3");
+  const yesPriceRaw = c.req.query("yes_price");
+
+  if (!q1 || !q2) return c.json({ error: "Missing p1 or p2 parameter" }, 400);
+
+  if (yesPriceRaw === undefined || yesPriceRaw === "") {
+    return c.json({ error: "yes_price required (1-99)" }, 400);
+  }
+  const yesPrice = parseInt(yesPriceRaw);
+  if (isNaN(yesPrice) || yesPrice < 1 || yesPrice > 99) {
+    return c.json({ error: "yes_price required (1-99)" }, 400);
+  }
+
+  const p1 = findPlayer(q1);
+  const p2 = findPlayer(q2);
+  if (!p1) return c.json({ error: `Player not found: ${q1}` }, 404);
+  if (!p2) return c.json({ error: `Player not found: ${q2}` }, 404);
+
+  const pred = predictMatch(p1, p2, surface, bestOf);
+  const ourProb = pred.p1_prob;
+
+  const marketProb = yesPrice / 100;
+  const noPriceCents = 100 - yesPrice;
+
+  const yesEdge = Math.round((ourProb - marketProb) * 1000) / 1000;
+  const noProb = Math.round((1 - ourProb) * 1000) / 1000;
+  const noEdge = Math.round((noProb - noPriceCents / 100) * 1000) / 1000;
+
+  // Half-Kelly for yes side: b = (100 - yes_price) / yes_price
+  const b = noPriceCents / yesPrice;
+  const kellyYes = Math.max(0, (b * ourProb - (1 - ourProb)) / b / 2);
+
+  // Half-Kelly for no side: b_no = yes_price / (100 - yes_price)
+  const bNo = yesPrice / noPriceCents;
+  const kellyNo = Math.max(0, (bNo * noProb - ourProb) / bNo / 2);
+
+  let bestSide: "yes" | "no" | null = null;
+  if (yesEdge > noEdge && yesEdge > 0) {
+    bestSide = "yes";
+  } else if (noEdge > yesEdge && noEdge > 0) {
+    bestSide = "no";
+  }
+
+  const kellyFraction = Math.round(
+    (bestSide === "yes" ? kellyYes : bestSide === "no" ? kellyNo : 0) * 1000
+  ) / 1000;
+
+  const hasEdge = bestSide !== null;
+  let summary: string;
+  if (bestSide === "yes") {
+    summary = `Bet YES on ${p1.name}: +${Math.round(yesEdge * 1000) / 10}% edge, ${Math.round(kellyFraction * 1000) / 10}% Kelly`;
+  } else if (bestSide === "no") {
+    summary = `Bet NO on ${p1.name} (YES on ${p2.name}): +${Math.round(noEdge * 1000) / 10}% edge, ${Math.round(kellyFraction * 1000) / 10}% Kelly`;
+  } else {
+    summary = "No meaningful edge detected — skip this market";
+  }
+
+  return c.json({
+    match: {
+      player1: { id: p1.player_id, name: p1.name, elo: getEloForSurface(p1, surface) },
+      player2: { id: p2.player_id, name: p2.name, elo: getEloForSurface(p2, surface) },
+      surface,
+      best_of: bestOf,
+    },
+    prediction: {
+      p1_prob: ourProb,
+      p2_prob: noProb,
+    },
+    market: {
+      yes_price_cents: yesPrice,
+      market_prob_p1: marketProb,
+      no_price_cents: noPriceCents,
+      market_prob_p2: Math.round((noPriceCents / 100) * 1000) / 1000,
+    },
+    edge: {
+      yes_edge: yesEdge,
+      no_edge: noEdge,
+      best_side: bestSide,
+      kelly_fraction: kellyFraction,
+      has_edge: hasEdge,
+      summary,
+    },
+    meta: {
+      model: "elo-xgb-v1",
+      data_as_of: "2024",
+      cost: "$0.25 USDC",
+    },
   });
 });
 
