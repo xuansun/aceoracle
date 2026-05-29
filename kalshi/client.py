@@ -23,10 +23,15 @@ class KalshiClient:
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
 
+    _PSS = padding.PSS(
+        mgf=padding.MGF1(hashes.SHA256()),
+        salt_length=padding.PSS.MAX_LENGTH,
+    )
+
     def _auth_headers(self, method: str, path: str) -> dict[str, str]:
         ts = str(int(time.time() * 1000))
         msg = f"{ts}{method.upper()}{path}"
-        sig = self._private_key.sign(msg.encode(), padding.PKCS1v15(), hashes.SHA256())
+        sig = self._private_key.sign(msg.encode(), self._PSS, hashes.SHA256())
         return {
             "KALSHI-ACCESS-KEY": self.key_id,
             "KALSHI-ACCESS-TIMESTAMP": ts,
